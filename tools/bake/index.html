@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>bake: four lighting passes into UV space</title>
+<style>html,body{margin:0;background:#111;color:#ddd;font:12px/1.4 monospace}#log{position:fixed;top:8px;left:8px;white-space:pre}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": { "three": "/node_modules/three/build/three.module.js", "three/addons/": "/node_modules/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="log">booting</div>
+<script type="module">
+// Bakes four lighting rigs (TL, TR, BL, BR) of a glTF mesh into UV space, dilates the islands,
+// and exposes the results as WebP data URLs on window.__bake. Driven by tools/bake/run.py.
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const q = new URLSearchParams(location.search);
+const MODEL = q.get('model') || '/public/models/coral.glb';
+const SIZE = parseInt(q.get('size') || '2048', 10);
+const DILATE = parseInt(q.get('dilate') || '24', 10);
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; console.log('[bake]', s); };
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+renderer.setSize(SIZE, SIZE, false);
+renderer.setPixelRatio(1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
+document.body.appendChild(renderer.domElement);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+// Four rigs: key light direction relative to the object, matching the corn site's TOP_L / TOP_R / BOTTOM_L / BOTTOM_R.
+const RIGS = [
+  { name: 'TL', key: [-2.4, 1.6, 0.7] },
+  { name: 'TR', key: [ 2.4, 1.6, 0.7] },
+  { name: 'BL', key: [-2.4, -1.2, 0.7] },
+  { name: 'BR', key: [ 2.4, -1.2, 0.7] },
+];
+
+function uvSpaceMaterial(src) {
+  const m = new THREE.MeshStandardMaterial({
+    map: src.map || null,
+    color: src.color ? src.color.clone() : new THREE.Color(1, 1, 1),
+    roughness: 0.85,
+    metalness: 0.0,
+    envMapIntensity: 0.22,
+    side: THREE.DoubleSide,
+  });
+  m.onBeforeCompile = (shader) => {
+    // Rasterize in UV space; lighting still uses the real world-space normal and view position.
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <project_vertex>',
+      '#include <project_vertex>\n  gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);'
+    );
+  };
+  return m;
+}
+
+const dilateMat = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, texel: { value: new THREE.Vector2(1 / SIZE, 1 / SIZE) } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: `
+    uniform sampler2D tSrc; uniform vec2 texel; varying vec2 vUv;
+    void main(){
+      vec4 c = texture2D(tSrc, vUv);
+      if (c.a > 0.5) { gl_FragColor = c; return; }
+      vec3 sum = vec3(0.0); float n = 0.0;
+      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        if (x == 0 && y == 0) continue;
+        vec4 s = texture2D(tSrc, vUv + vec2(float(x), float(y)) * texel);
+        if (s.a > 0.5) { sum += s.rgb; n += 1.0; }
+      }
+      gl_FragColor = n > 0.0 ? vec4(sum / n, 1.0) : vec4(0.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const quadGeo = new THREE.PlaneGeometry(2, 2);
+const quadScene = new THREE.Scene();
+const quad = new THREE.Mesh(quadGeo, dilateMat);
+quadScene.add(quad);
+const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+function makeRT() {
+  return new THREE.WebGLRenderTarget(SIZE, SIZE, {
+    format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false, stencilBuffer: false,
+    colorSpace: THREE.SRGBColorSpace,
+  });
+}
+
+function rtToDataURL(rt, mime, quality) {
+  const px = new Uint8Array(SIZE * SIZE * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, SIZE, SIZE, px);
+  const c = document.createElement('canvas'); c.width = SIZE; c.height = SIZE;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(SIZE, SIZE);
+  // GL rows run bottom-up; flip so the canvas top is +v. Loaded later with flipY = true (TextureLoader default).
+  for (let y = 0; y < SIZE; y++) {
+    const src = (SIZE - 1 - y) * SIZE * 4, dst = y * SIZE * 4;
+    img.data.set(px.subarray(src, src + SIZE * 4), dst);
+  }
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL(mime, quality);
+}
+
+async function main() {
+  log('model ' + MODEL);
+  const loader = new GLTFLoader();
+  const draco = new DRACOLoader();
+  draco.setDecoderPath('/node_modules/three/examples/jsm/libs/draco/');
+  loader.setDRACOLoader(draco);
+  const gltf = await loader.loadAsync(MODEL);
+  const meshes = [];
+  gltf.scene.traverse((o) => { if (o.isMesh) meshes.push(o); });
+  log('meshes ' + meshes.length + ' verts ' + meshes.reduce((a, m) => a + m.geometry.attributes.position.count, 0));
+  if (!meshes.length || !meshes[0].geometry.attributes.uv) throw new Error('mesh without uv');
+
+  // Normalize the object: centre and fit to unit size so light directions mean the same thing for any model.
+  // Same pivot as the app: the fan lies in its local XZ plane, so tip it up to face the camera.
+  const pivot = new THREE.Group();
+  pivot.rotation.x = -Math.PI / 2;
+  pivot.add(gltf.scene);
+  pivot.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(pivot);
+  const size = new THREE.Vector3(); box.getSize(size);
+  const centre = new THREE.Vector3(); box.getCenter(centre);
+  const scale = 1.6 / Math.max(size.x, size.y, size.z);
+  const holder = new THREE.Group();
+  holder.add(pivot);
+  pivot.position.sub(centre);
+  holder.scale.setScalar(scale);
+  holder.updateMatrixWorld(true);
+
+  const scene = new THREE.Scene();
+  scene.environment = envTex;
+  scene.add(holder);
+  const cam = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
+  cam.position.set(0, 0, 4); cam.lookAt(0, 0, 0);
+
+  const key = new THREE.DirectionalLight(0xfff3e6, 2.2);
+  const fill = new THREE.DirectionalLight(0xbfd6ff, 0.25);
+  const hemi = new THREE.HemisphereLight(0xdfe9ff, 0x2a1f33, 0.18);
+  scene.add(key, fill, hemi);
+
+  meshes.forEach((m) => { m.userData.srcMat = m.material; m.material = uvSpaceMaterial(m.material); m.frustumCulled = false; });
+
+  const rtA = makeRT(), rtB = makeRT();
+  const out = {};
+  for (const rig of RIGS) {
+    key.position.set(...rig.key).multiplyScalar(4);
+    fill.position.set(-rig.key[0], -rig.key[1] * 0.5, 2.5).multiplyScalar(3);
+    renderer.setRenderTarget(rtA);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear();
+    renderer.render(scene, cam);
+    // Dilate islands so bilinear filtering and mipmaps never bleed the clear colour into the mesh.
+    let src = rtA, dst = rtB;
+    for (let i = 0; i < DILATE; i++) {
+      dilateMat.uniforms.tSrc.value = src.texture;
+      renderer.setRenderTarget(dst);
+      renderer.clear();
+      renderer.render(quadScene, orthoCam);
+      [src, dst] = [dst, src];
+    }
+    out[rig.name] = rtToDataURL(src, 'image/webp', 0.92);
+    log('rig ' + rig.name + ' done ' + Math.round(out[rig.name].length / 1024) + ' KB (base64)');
+  }
+  renderer.setRenderTarget(null);
+  // Results go into the DOM, not window globals: the driver's evaluate() runs in an isolated world.
+  for (const [name, data] of Object.entries(out)) {
+    const ta = document.createElement('textarea');
+    ta.id = 'pass-' + name; ta.style.display = 'none'; ta.value = data;
+    document.body.appendChild(ta);
+  }
+  document.body.dataset.passes = Object.keys(out).join(',');
+  document.body.dataset.bakeDone = '1';
+  log('DONE');
+}
+main().catch((e) => { log('ERROR ' + (e && e.message ? e.message : e)); document.body.dataset.bakeError = String(e); document.body.dataset.bakeDone = '1'; });
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+node_modules
+.nuxt
+.output
+.data
+dist
+*.log
+.DS_Store
+tools/bake/out
+tools/*.glb
+.gh-pages-wt
